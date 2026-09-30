@@ -1,0 +1,664 @@
+#!/usr/bin/env bash
+#
+# vw - virtual-wayland session manager
+#
+# Starts a *nested* Wayland compositor (a second labwc in a window on the
+# normal desktop) and drives it with its own virtual input devices, so test
+# scripts never touch the real session: screenshots come from the nested
+# output and every pointer/key event is injected over
+# zwlr_virtual_pointer / zwp_virtual_keyboard (no /dev/uinput, the host
+# mouse and keyboard are untouched).
+#
+#   vw start [--size WxH] [--scale N] [--headless] [--title T]
+#                                default size  = 50% of the host screen
+#                                default scale = 0.5
+#   vw stop | status | env | logs
+#   vw size WxH                        output mode (buffer pixels)
+#   vw scale N                         output scale (default 0.5)
+#   vw shot FILE [grim args...]        screenshot of the nested output
+#   vw input <vwinput args...>         inject pointer/keyboard events
+#   vw run [-f] CMD...                 run a program inside the session
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VWINPUT="${VWINPUT:-$SCRIPT_DIR/../bin/vwinput}"
+RUNDIR="${VIRTUAL_WAYLAND_DIR:-${TMPDIR:-/tmp}/virtual-wayland}"
+CFGDIR="$RUNDIR/config"
+PIDFILE="$RUNDIR/labwc.pid"
+SOCKFILE="$RUNDIR/wayland-display"
+ENVFILE="$RUNDIR/env"
+LOGFILE="$RUNDIR/labwc.log"
+MODEFILE="$RUNDIR/mode"      # windowed | headless
+SIZEFILE="$RUNDIR/size"      # size the session was asked for
+SCALEFILE="$RUNDIR/scale"    # output scale the session was asked for
+HOSTFILE="$RUNDIR/host-display"        # the host socket labwc nests in
+SESSIONFILE="$RUNDIR/session-display"  # our own nested socket
+DEFAULT_SIZE="1440x1000"   # fallback when the host screen size is unreadable
+DEFAULT_SCALE="0.5"        # output scale; logical desktop = mode / scale
+
+# The host compositor labwc has to nest into. `eval $(vw env)` - or a
+# `vw restart` run in that same shell - makes WAYLAND_DISPLAY point at our
+# *own* nested socket, and nesting there would kill the very session being
+# restarted, so recognise that case and fall back to the display recorded
+# when the session was started.
+host_display() {
+    if [ -n "${VW_HOST_DISPLAY:-}" ]; then
+        echo "$VW_HOST_DISPLAY"
+        return 0
+    fi
+    local cur="${WAYLAND_DISPLAY:-}" mine saved
+    mine="$(cat "$SESSIONFILE" 2>/dev/null || true)"
+    saved="$(cat "$HOSTFILE" 2>/dev/null || true)"
+    if [ -n "$mine" ] && { [ -z "$cur" ] || [ "$cur" = "$mine" ]; }; then
+        cur="${saved:-wayland-0}"
+    fi
+    if [ -z "$cur" ] || [ "$cur" = "$mine" ]; then
+        cur="${saved:-wayland-0}"
+    fi
+    echo "$cur"
+}
+HOST_DISPLAY="$(host_display)"
+
+die() { echo "vw: $*" >&2; exit 1; }
+msg() { echo "vw: $*"; }
+
+# Usage block: the leading comment of this file, up to the first code line.
+print_help() {
+    awk 'NR > 1 && /^set -euo/ { exit }
+         NR > 1 { sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"
+}
+
+# ---------------------------------------------------------------- helpers
+
+session_pid() {
+    [ -f "$PIDFILE" ] || return 1
+    local pid
+    pid="$(cat "$PIDFILE" 2>/dev/null || true)"
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    echo "$pid"
+}
+
+current_socket() {
+    [ -f "$SOCKFILE" ] || return 1
+    local sock
+    sock="$(cat "$SOCKFILE" 2>/dev/null || true)"
+    [ -n "$sock" ] || return 1
+    [ -S "$XDG_RUNTIME_DIR/$sock" ] || return 1
+    echo "$sock"
+}
+
+require_session() {
+    session_pid >/dev/null || die "no virtual-wayland session (run: vw start)"
+    SOCK="$(current_socket)" || die "session socket missing (run: vw restart)"
+}
+
+list_wayland_sockets() {
+    # only real sockets, not the .lock files
+    local f
+    for f in "$XDG_RUNTIME_DIR"/wayland-*; do
+        [ -S "$f" ] || continue
+        basename "$f"
+    done | sort
+}
+
+ensure_vwinput() {
+    [ -x "$VWINPUT" ] && return 0
+    msg "vwinput not built yet, building..."
+    "$SCRIPT_DIR/build.sh" >&2
+    [ -x "$VWINPUT" ] || die "build failed ($SCRIPT_DIR/build.sh)"
+}
+
+# Current output mode, e.g. 1440x1000
+current_mode() {
+    [ -n "${SOCK:-}" ] || return 1
+    WAYLAND_DISPLAY="$SOCK" wlr-randr 2>/dev/null \
+        | sed -n 's/^[[:space:]]*\([0-9]\+x[0-9]\+\) px (current).*/\1/p' \
+        | head -n1
+}
+
+# Current fractional output scale, e.g. 0.500000
+current_scale() {
+    [ -n "${SOCK:-}" ] || return 1
+    WAYLAND_DISPLAY="$SOCK" wlr-randr 2>/dev/null \
+        | sed -n 's/^[[:space:]]*Scale:[[:space:]]*\([0-9.]\+\).*/\1/p' \
+        | head -n1
+}
+
+# A scale is a plain number > 0 (0.5, 1, 1.5, 2, ...).
+valid_scale() {
+    awk -v s="${1:-}" 'BEGIN {
+        exit !(s ~ /^[0-9]*\.?[0-9]+$/ && s + 0 > 0 && s + 0 <= 16)
+    }'
+}
+
+# Same scale, numerically: wlr-randr prints 0.500000 where we store 0.5.
+same_scale() {
+    awk -v a="${1:-}" -v b="${2:-}" 'BEGIN { exit !(a + 0 == b + 0) }'
+}
+
+# Name of the first enabled output (wlr-randr --output <name> needs it).
+enabled_output() {
+    [ -n "${SOCK:-}" ] || return 1
+    WAYLAND_DISPLAY="$SOCK" wlr-randr --json 2>/dev/null \
+        | python3 -c 'import json,sys
+try:
+    outs=json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+for o in outs:
+    if o.get("enabled"):
+        print(o["name"]); break' || true
+}
+
+# Does the compositor actually deliver a frame? In windowed mode the host
+# window can be hidden, or refuse a resize, and rendering then stops - grim
+# would block forever, so everything that matters goes through this probe.
+probe_frame() {
+    local f="$RUNDIR/.probe.png"
+    timeout 5 env WAYLAND_DISPLAY="$SOCK" grim "$f" >/dev/null 2>&1 || return 1
+    rm -f "$f"
+    return 0
+}
+
+# Logical size (WxH) of the largest enabled host output - physical pixels
+# divided by the output scale, with 90/270 transforms swapped - i.e. the
+# size the desktop really occupies in logical pixels. Prints nothing and
+# fails when it cannot be read (headless host, no wlr-randr/python3).
+host_screen_size() {
+    command -v wlr-randr >/dev/null 2>&1 || return 1
+    command -v python3  >/dev/null 2>&1 || return 1
+    local out
+    out="$(WAYLAND_DISPLAY="$HOST_DISPLAY" wlr-randr --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    outs = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+best = None
+for o in outs:
+    if not o.get("enabled"):
+        continue
+    mode = next((m for m in (o.get("modes") or []) if m.get("current")), None)
+    if not mode:
+        continue
+    try:
+        scale = float(o.get("scale") or 1.0) or 1.0
+        w = int(round(mode["width"] / scale))
+        h = int(round(mode["height"] / scale))
+    except Exception:
+        continue
+    if o.get("transform") in ("90", "270", "flipped-90", "flipped-270"):
+        w, h = h, w
+    if best is None or w * h > best[0] * best[1]:
+        best = (w, h)
+if best:
+    print("%dx%d" % best)
+' )" || return 1
+    [ -n "$out" ] || return 1
+    echo "$out"
+}
+
+# 50% of a WxH size: each dimension halved (odd values rounded down),
+# floored at 320x200 so the nested session stays usable on small screens.
+half_size() {
+    local wh="${1:-}" w h hw hh
+    case "$wh" in
+        *x*) ;;
+        *)   return 1 ;;
+    esac
+    w="${wh%%x*}"; h="${wh##*x}"
+    case "$w$h" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$w" -gt 0 ] 2>/dev/null && [ "$h" -gt 0 ] 2>/dev/null || return 1
+    hw=$((w / 2)); hh=$((h / 2))
+    [ "$hw" -lt 320 ] && hw=320
+    [ "$hh" -lt 200 ] && hh=200
+    echo "${hw}x${hh}"
+}
+
+# The default session size when --size is absent: half of the host screen
+# in each dimension, so the nested window never covers the real desktop.
+default_size() {
+    local host half
+    # messages go to stderr: this function's stdout is the size itself
+    if host="$(host_screen_size)" && half="$(half_size "$host")"; then
+        msg "default size: 50% of host screen ($host) -> $half" >&2
+        echo "$half"
+        return 0
+    fi
+    msg "warning: cannot read host screen size, defaulting to $DEFAULT_SIZE" >&2
+    echo "$DEFAULT_SIZE"
+}
+
+# processes started with WAYLAND_DISPLAY=<session socket> (clients we launched)
+session_clients() {
+    local e pid
+    for e in /proc/[0-9]*/environ; do
+        [ -r "$e" ] || continue
+        pid="${e#/proc/}"; pid="${pid%/environ}"
+        [ "$pid" = "$$" ] && continue
+        if tr '\0' '\n' < "$e" 2>/dev/null | grep -qx "WAYLAND_DISPLAY=$1"; then
+            echo "$pid"
+        fi
+    done 2>/dev/null
+    return 0
+}
+
+# ------------------------------------------------------------------ start
+
+cmd_start() {
+    local size="" title="virtual-wayland" headless=0 scale=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --size)   size="${2:?--size needs WxH}"; shift 2 ;;
+            --scale)  scale="${2:?--scale needs a number}"; shift 2 ;;
+            --title)  title="${2:?--title needs a string}"; shift 2 ;;
+            --headless) headless=1; shift ;;
+            -h|--help)
+                print_help
+                return 0 ;;
+            *) die "start: unknown argument '$1'" ;;
+        esac
+    done
+
+    if session_pid >/dev/null; then
+        SOCK="$(current_socket || true)"
+        msg "already running (pid $(session_pid), WAYLAND_DISPLAY=${SOCK:-?})"
+        [ -n "${SOCK:-}" ] && msg "run 'vw env' to export it"
+        return 0
+    fi
+
+    [ -n "${XDG_RUNTIME_DIR:-}" ] || die "XDG_RUNTIME_DIR is not set"
+    command -v labwc >/dev/null 2>&1 || die "labwc not found"
+    mkdir -p "$RUNDIR"
+
+    # No --size given ("" here, while "auto" stays "auto"): the nested window
+    # becomes 50% of the host screen, so it never swallows the real desktop.
+    if [ -z "$size" ]; then
+        size="$(default_size)"
+    fi
+
+    # No --scale given: the compositor renders at 0.5, so the logical desktop
+    # inside the session is twice the window - on this laptop the default
+    # 780x520 window still hands the app a 1560x1040 desktop.
+    if [ -z "$scale" ]; then
+        scale="$DEFAULT_SCALE"
+    fi
+    valid_scale "$scale" || die "start: invalid --scale '$scale' (need a number > 0, e.g. 0.5)"
+
+    # Isolated labwc config: same keybindings/theme as the real session
+    # (~/.config/labwc/rc.xml, so Super+Up still means ToggleMaximize) but a
+    # no-op autostart, so kanshi/noctalia/clipman are not started twice.
+    rm -rf "$CFGDIR"
+    mkdir -p "$CFGDIR"
+    local f
+    for f in rc.xml menu.xml themerc environment; do
+        [ -f "$HOME/.config/labwc/$f" ] && cp "$HOME/.config/labwc/$f" "$CFGDIR/"
+    done
+    cat > "$CFGDIR/autostart" <<'AUTOSTART'
+#!/bin/sh
+# virtual-wayland: deliberately empty (host session services stay out)
+exit 0
+AUTOSTART
+    chmod +x "$CFGDIR/autostart"
+
+    # Snapshot the sockets we must not steal, so we can spot ours afterwards.
+    local before="$RUNDIR/.sockets-before"
+    list_wayland_sockets > "$before"
+
+    : > "$LOGFILE"
+    if [ "$headless" = 1 ]; then
+        WLR_BACKENDS=headless \
+        WAYLAND_DISPLAY= \
+        labwc -C "$CFGDIR" -t "$title" >>"$LOGFILE" 2>&1 &
+    else
+        WAYLAND_DISPLAY="$HOST_DISPLAY" \
+        labwc -C "$CFGDIR" -t "$title" >>"$LOGFILE" 2>&1 &
+    fi
+    local pid=$!
+    echo "$pid" > "$PIDFILE"
+    if [ "$headless" = 1 ]; then
+        msg "labwc started (pid $pid, headless), log $LOGFILE"
+    else
+        msg "labwc started (pid $pid, nested in $HOST_DISPLAY), log $LOGFILE"
+    fi
+
+    # Wait for the new wayland socket.
+    local sock="" tries=0
+    while [ "$tries" -lt 100 ]; do
+        tries=$((tries + 1))
+        if ! kill -0 "$pid" 2>/dev/null; then
+            rm -f "$PIDFILE"
+            die "labwc exited immediately, see $LOGFILE"
+        fi
+        sock="$(comm -13 "$before" <(list_wayland_sockets) 2>/dev/null | head -n1 || true)"
+        [ -n "$sock" ] && break
+        sleep 0.1
+    done
+    [ -n "$sock" ] || { cmd_stop --quiet; die "no nested Wayland socket appeared, see $LOGFILE"; }
+    echo "$sock" > "$SOCKFILE"
+    printf 'export WAYLAND_DISPLAY=%s\n' "$sock" > "$ENVFILE"
+    SOCK="$sock"
+    # remembered across `vw stop`, so a later restart can tell our own nested
+    # socket from the real host one (see host_display() above)
+    printf '%s\n' "$sock"   > "$SESSIONFILE"
+    printf '%s\n' "$HOST_DISPLAY" > "$HOSTFILE"
+
+    # Give the compositor a moment, then confirm it answers.
+    local ready=0
+    for tries in 1 2 3 4 5 6 7 8 9 10; do
+        if WAYLAND_DISPLAY="$sock" wlr-randr >/dev/null 2>&1; then ready=1; break; fi
+        sleep 0.3
+    done
+    [ "$ready" = 1 ] || msg "warning: nested compositor not answering yet ($LOGFILE)"
+
+    if [ -n "$size" ] && [ "$size" != "auto" ]; then
+        cmd_size "$size" || msg "warning: could not set output size $size"
+    fi
+
+    # Scale last: it never resizes the host window (the buffer stays WxH, only
+    # the logical desktop changes), so it is safe to apply after the mode.
+    if ! command -v wlr-randr >/dev/null 2>&1; then
+        msg "warning: wlr-randr not installed - keeping scale 1.0"
+    else
+        cmd_scale "$scale" || msg "warning: could not set output scale $scale"
+    fi
+
+    if [ "$headless" = 1 ]; then
+        printf 'headless\n' > "$MODEFILE"
+    else
+        printf 'windowed\n' > "$MODEFILE"
+    fi
+    printf '%s\n' "${size:-auto}" > "$SIZEFILE"
+
+    msg "session ready"
+    msg "  output: mode $(current_mode || echo "${size:-auto}") @ scale $(current_scale || echo '?')"
+    msg "  export WAYLAND_DISPLAY=$sock      # or: eval \$(vw env)"
+    msg "  vw shot <file> | vw input ... | vw run <cmd>"
+}
+
+# ------------------------------------------------------------------- stop
+
+cmd_stop() {
+    local quiet=0 keep_clients=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --quiet) quiet=1; shift ;;
+            --keep-clients) keep_clients=1; shift ;;
+            *) die "stop: unknown argument '$1'" ;;
+        esac
+    done
+
+    local sock="" pid=""
+    sock="$(current_socket || true)"
+    pid="$(session_pid || true)"
+
+    if [ "$keep_clients" = 0 ] && [ -n "$sock" ]; then
+        local clients
+        clients="$(session_clients "$sock" | tr '\n' ' ' || true)"
+        if [ -n "${clients// /}" ]; then
+            [ "$quiet" = 0 ] && msg "stopping clients: $clients"
+            # shellcheck disable=SC2086
+            kill $clients 2>/dev/null || true
+            sleep 0.4
+            # shellcheck disable=SC2086
+            kill -9 $clients 2>/dev/null || true
+        fi
+    fi
+
+    if [ -n "$pid" ]; then
+        [ "$quiet" = 0 ] && msg "stopping labwc (pid $pid)"
+        kill "$pid" 2>/dev/null || true
+        for _ in $(seq 1 50); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.1
+        done
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+
+    # stale sockets of crashed sessions
+    if [ -n "$sock" ] && [ ! -S "$XDG_RUNTIME_DIR/$sock" ]; then :; fi
+
+    rm -f "$PIDFILE" "$SOCKFILE" "$RUNDIR/.sockets-before"
+    rm -f "$ENVFILE" "$MODEFILE" "$SIZEFILE" "$SCALEFILE"
+    # HOSTFILE / SESSIONFILE stay: they identify the nested socket so a later
+    # `vw restart` (possibly run inside `eval $(vw env)`) still nests into the
+    # real host compositor instead of its own dying socket.
+    [ "$quiet" = 0 ] && msg "stopped"
+    return 0
+}
+
+# ----------------------------------------------------------------- status
+
+cmd_status() {
+    local pid sock
+    pid="$(session_pid || true)"
+    if [ -z "${pid:-}" ]; then
+        echo "state: stopped"
+        return 1
+    fi
+    sock="$(current_socket || true)"
+    echo "state: running"
+    echo "pid:   $pid"
+    echo "sock:  ${sock:-<missing>}"
+    echo "env:   $ENVFILE"
+    echo "log:   $LOGFILE"
+    if [ -n "${sock:-}" ] && command -v wlr-randr >/dev/null 2>&1; then
+        SOCK="$sock"
+        echo "scale: $(current_scale || echo '?')"
+        echo "output:"
+        WAYLAND_DISPLAY="$sock" wlr-randr 2>/dev/null | sed 's/^/  /' || echo "  <no answer>"
+        # windowed sessions follow the host window: if it was resized, the
+        # screenshot size and the absolute-coordinate space change with it.
+        local want have mode
+        want="$(cat "$SIZEFILE" 2>/dev/null || true)"
+        mode="$(cat "$MODEFILE" 2>/dev/null || true)"
+        have="$(current_mode || true)"
+        if [ -n "$want" ] && [ "$want" != "auto" ] && [ -n "$have" ] && [ "$have" != "$want" ]; then
+            echo "note:  session was started at $want but the output is now $have"
+            echo "       (the host window changed size) - screenshots and absolute"
+            echo "       coordinates follow $have. Restore with: vw restart --size $want"
+        fi
+        # screenshots are taken at the real scale, so a scale change outside
+        # `vw` silently changes what `vw shot` produces - call it out.
+        local want_scale have_scale
+        want_scale="$(cat "$SCALEFILE" 2>/dev/null || true)"
+        have_scale="$(current_scale || true)"
+        if [ -n "$want_scale" ] && [ -n "$have_scale" ] && ! same_scale "$want_scale" "$have_scale"; then
+            echo "note:  session was started at scale $want_scale but the output is"
+            echo "       now scale $have_scale - screenshots follow $have_scale."
+            echo "       Restore with: vw scale $want_scale"
+        fi
+        [ "$mode" = "windowed" ] || true
+    fi
+    if [ -n "${sock:-}" ]; then
+        local clients
+        clients="$(session_clients "$sock" | tr '\n' ' ' || true)"
+        [ -n "${clients// /}" ] && echo "clients: $clients"
+    fi
+    return 0
+}
+
+cmd_env() {
+    local sock
+    sock="$(current_socket)" || die "no session (run: vw start)"
+    echo "export WAYLAND_DISPLAY=$sock"
+}
+
+cmd_logs() {
+    local n="${1:-40}"
+    tail -n "$n" "$LOGFILE"
+}
+
+# ------------------------------------------------------------------- size
+
+cmd_size() {
+    local wh="${1:?usage: vw size WxH}"
+    require_session
+    command -v wlr-randr >/dev/null 2>&1 || die "wlr-randr not installed"
+    local name
+    name="$(enabled_output || true)"
+    [ -n "$name" ] || { echo "vw: could not read output name from wlr-randr" >&2; return 1; }
+
+    local prev
+    prev="$(current_mode || true)"
+    if [ "$prev" = "$wh" ]; then
+        printf '%s\n' "$wh" > "$SIZEFILE"
+        msg "output $name already $wh"
+        return 0
+    fi
+
+    WAYLAND_DISPLAY="$SOCK" wlr-randr --output "$name" --custom-mode "$wh" >/dev/null \
+        || { echo "vw: wlr-randr refused mode $wh" >&2; return 1; }
+    printf '%s\n' "$wh" > "$SIZEFILE"
+    msg "output $name -> $wh"
+
+    # A windowed session's output mirrors the host window. If that window will
+    # not resize (or is hidden) the compositor never gets another frame and
+    # every screenshot hangs from here on - so probe immediately and undo.
+    if [ -n "$prev" ] && ! probe_frame; then
+        msg "warning: no frame after resizing to $wh - rolling back to $prev"
+        WAYLAND_DISPLAY="$SOCK" wlr-randr --output "$name" --custom-mode "$prev" >/dev/null 2>&1 || true
+        printf '%s\n' "$prev" > "$SIZEFILE"
+        echo "vw: the host window refused to become $wh (it is $prev)." >&2
+        echo "vw: restart the session at the new size instead: vw restart --size $wh" >&2
+        return 1
+    fi
+    return 0
+}
+
+# ------------------------------------------------------------------ scale
+
+# Output scale of the nested compositor (0.5 = the desktop inside the session
+# is twice the buffer). It never resizes the host window - only the logical
+# size the apps see - so `vw shot` is always taken at this scale to stay
+# pixel-for-pixel identical to `vw input -a` coordinates.
+cmd_scale() {
+    local s="${1:?usage: vw scale <factor>}"
+    require_session
+    command -v wlr-randr >/dev/null 2>&1 || die "wlr-randr not installed"
+    valid_scale "$s" || die "invalid scale '$s' (need a number > 0, e.g. 0.5)"
+
+    local name prev
+    name="$(enabled_output || true)"
+    [ -n "$name" ] || { echo "vw: could not read output name from wlr-randr" >&2; return 1; }
+    prev="$(current_scale || true)"
+
+    if [ -n "$prev" ] && same_scale "$prev" "$s"; then
+        printf '%s\n' "$s" > "$SCALEFILE"
+        msg "output $name already at scale $s"
+        return 0
+    fi
+
+    WAYLAND_DISPLAY="$SOCK" wlr-randr --output "$name" --scale "$s" >/dev/null \
+        || { echo "vw: wlr-randr refused scale $s" >&2; return 1; }
+    printf '%s\n' "$s" > "$SCALEFILE"
+    msg "output $name scale -> $s (mode stays $(current_mode || echo '?'), logical = mode / scale)"
+
+    if [ -n "$prev" ] && ! probe_frame; then
+        msg "warning: no frame after scaling to $s - rolling back to $prev"
+        WAYLAND_DISPLAY="$SOCK" wlr-randr --output "$name" --scale "$prev" >/dev/null 2>&1 || true
+        printf '%s\n' "$prev" > "$SCALEFILE"
+        echo "vw: the compositor stopped delivering frames at scale $s." >&2
+        return 1
+    fi
+    return 0
+}
+
+# ------------------------------------------------------------------- shot
+
+cmd_shot() {
+    [ $# -ge 1 ] || die "usage: vw shot <file> [grim args...]"
+    local file="$1"; shift
+    require_session
+    command -v grim >/dev/null 2>&1 || die "grim not installed"
+
+    # grim's default is logical size x the *integer* wl_output.scale, which at
+    # a fractional scale is neither the buffer nor what vwinput injects into.
+    # Pin -s to the real output scale: the image then comes out exactly at the
+    # mode size (the window's pixels), i.e. 1:1 with `vw input -a` coordinates.
+    # Anything the caller passed wins.
+    local scale_args=() a sc want_scale=0
+    for a in "$@"; do
+        if [ "$a" = "-s" ] || [ "$a" = "--scale" ]; then want_scale=1; break; fi
+    done
+    if [ "$want_scale" = 0 ] && sc="$(current_scale)" && [ -n "$sc" ]; then
+        scale_args=(-s "$sc")
+    fi
+
+    local attempt
+    for attempt in 1 2; do
+        if timeout 10 env WAYLAND_DISPLAY="$SOCK" grim -c "${scale_args[@]}" "$@" "$file"; then
+            msg "shot -> $file"
+            return 0
+        fi
+        msg "warning: grim timed out (attempt $attempt) - is the nested window"
+        msg "          visible on the desktop? A hidden/occluded windowed session"
+        msg "          stops rendering. Use 'vw restart --headless' for unattended runs."
+        sleep 0.5
+    done
+    die "screenshot failed - try: vw restart --headless"
+}
+
+# ------------------------------------------------------------------- input
+
+cmd_input() {
+    [ $# -ge 1 ] || die "usage: vw input <vwinput args...>  (see: vwinput help)"
+    require_session
+    ensure_vwinput
+    WAYLAND_DISPLAY="$SOCK" "$VWINPUT" "$@"
+}
+
+# -------------------------------------------------------------------- run
+
+cmd_run() {
+    local foreground=0
+    if [ "${1:-}" = "-f" ]; then foreground=1; shift; fi
+    [ $# -ge 1 ] || die "usage: vw run [-f] <command...>"
+    require_session
+    mkdir -p "$RUNDIR"
+
+    if [ "$foreground" = 1 ]; then
+        WAYLAND_DISPLAY="$SOCK" "$@"
+        return $?
+    fi
+
+    local n log
+    shopt -s nullglob
+    local existing=( "$RUNDIR"/client-*.log )
+    shopt -u nullglob
+    n=${#existing[@]}
+    log="$RUNDIR/client-$((n + 1)).log"
+    (
+        WAYLAND_DISPLAY="$SOCK" "$@" >"$log" 2>&1 &
+        echo $! > "$log.pid"
+    )
+    sleep 0.2
+    local pid
+    pid="$(cat "$log.pid" 2>/dev/null || true)"
+    rm -f "$log.pid"
+    msg "started pid ${pid:-?} log=$log"
+}
+
+# ------------------------------------------------------------------ args
+
+[ $# -ge 1 ] || die "usage: vw <start|stop|status|env|size|scale|shot|input|run|logs|restart>"
+cmd="$1"; shift
+
+case "$cmd" in
+    start)   cmd_start "$@" ;;
+    stop)    cmd_stop "$@" ;;
+    restart) cmd_stop --quiet; cmd_start "$@" ;;  # args go to start
+    status)  cmd_status "$@" ;;
+    env)     cmd_env "$@" ;;
+    size)    cmd_size "$@" ;;
+    scale)   cmd_scale "$@" ;;
+    shot)    cmd_shot "$@" ;;
+    input)   cmd_input "$@" ;;
+    run)     cmd_run "$@" ;;
+    logs)    cmd_logs "$@" ;;
+    -h|--help|help) print_help ;;
+    *) die "unknown command '$cmd' (start|stop|restart|status|env|size|scale|shot|input|run|logs)" ;;
+esac

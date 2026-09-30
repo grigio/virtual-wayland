@@ -1,0 +1,3 @@
+# build artifacts — rebuilt by scripts/build.sh (vw builds on first use too)
+bin/
+scripts/build/
